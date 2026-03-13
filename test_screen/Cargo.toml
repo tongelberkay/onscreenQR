@@ -1,0 +1,8 @@
+[package]
+name = "test_screen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+screenshots = "0.8"
+image = "0.24"

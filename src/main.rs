@@ -8,11 +8,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
-use eframe::egui::{self, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, ResizeDirection, Stroke, Vec2};
+use eframe::egui::{
+    self, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, ResizeDirection, Stroke, Vec2,
+};
 use image::{DynamicImage, GrayImage, ImageBuffer, Luma};
 use rxing::{
-    common::HybridBinarizer, BinaryBitmap, BufferedImageLuminanceSource,
-    DecodeHintType, DecodeHintValue, MultiFormatReader, Reader,
+    common::HybridBinarizer, BinaryBitmap, BufferedImageLuminanceSource, DecodeHintType,
+    DecodeHintValue, MultiFormatReader, Reader,
 };
 use screenshots::Screen;
 
@@ -24,37 +26,72 @@ struct ScanState {
     copied_until: Option<Instant>,
 }
 
-type WinPos = Arc<Mutex<Option<[i32; 2]>>>;
-type VfRect = Arc<Mutex<Option<[i32; 4]>>>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaptureArea {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl CaptureArea {
+    fn from_viewfinder(window_min: Pos2, viewfinder: Rect) -> Self {
+        Self {
+            x: (window_min.x + viewfinder.min.x).floor() as i32,
+            y: (window_min.y + viewfinder.min.y).floor() as i32,
+            width: viewfinder.width().max(0.0).ceil() as u32,
+            height: viewfinder.height().max(0.0).ceil() as u32,
+        }
+    }
+
+    fn anchor_point(self) -> (i32, i32) {
+        (
+            self.x + self.width.saturating_div(2) as i32,
+            self.y + self.height.saturating_div(2) as i32,
+        )
+    }
+
+    fn relative_to_origin(self, screen_x: i32, screen_y: i32) -> Self {
+        Self {
+            x: self.x - screen_x,
+            y: self.y - screen_y,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+type CaptureRect = Arc<Mutex<Option<CaptureArea>>>;
 
 struct QrFrameApp {
     state: Arc<Mutex<ScanState>>,
-    vf_rect: VfRect,
-    win_pos: WinPos,
+    capture_rect: CaptureRect,
     clipboard: Option<Clipboard>,
 }
 
 impl QrFrameApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut style = (*cc.egui_ctx.style()).clone();
-        style.visuals.panel_fill  = Color32::TRANSPARENT;
+        style.visuals.panel_fill = Color32::TRANSPARENT;
         style.visuals.window_fill = Color32::TRANSPARENT;
         style.visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
         cc.egui_ctx.set_style(style);
 
         let state: Arc<Mutex<ScanState>> = Arc::new(Mutex::new(ScanState::default()));
-        let vf_rect: VfRect = Arc::new(Mutex::new(None));
-        let win_pos: WinPos = Arc::new(Mutex::new(None));
+        let capture_rect: CaptureRect = Arc::new(Mutex::new(None));
 
         {
-            let state   = Arc::clone(&state);
-            let vf_rect = Arc::clone(&vf_rect);
-            let win_pos = Arc::clone(&win_pos);
-            let ctx     = cc.egui_ctx.clone();
-            thread::spawn(move || scan_loop(state, vf_rect, win_pos, ctx));
+            let state = Arc::clone(&state);
+            let capture_rect = Arc::clone(&capture_rect);
+            let ctx = cc.egui_ctx.clone();
+            thread::spawn(move || scan_loop(state, capture_rect, ctx));
         }
 
-        Self { state, vf_rect, win_pos, clipboard: Clipboard::new().ok() }
+        Self {
+            state,
+            capture_rect,
+            clipboard: Clipboard::new().ok(),
+        }
     }
 }
 
@@ -76,14 +113,65 @@ impl eframe::App for QrFrameApp {
         // We paint invisible interaction zones along every edge/corner
         // and issue BeginResize when the user drags them.
         let dirs: &[(ResizeDirection, Rect)] = &[
-            (ResizeDirection::NorthWest, Rect::from_min_size(win_rect.min, Vec2::splat(RESIZE_BORDER))),
-            (ResizeDirection::North,     Rect::from_min_size(Pos2::new(win_rect.min.x + RESIZE_BORDER, win_rect.min.y), Vec2::new(win_rect.width() - RESIZE_BORDER * 2.0, RESIZE_BORDER))),
-            (ResizeDirection::NorthEast, Rect::from_min_size(Pos2::new(win_rect.max.x - RESIZE_BORDER, win_rect.min.y), Vec2::splat(RESIZE_BORDER))),
-            (ResizeDirection::East,      Rect::from_min_size(Pos2::new(win_rect.max.x - RESIZE_BORDER, win_rect.min.y + RESIZE_BORDER), Vec2::new(RESIZE_BORDER, win_rect.height() - RESIZE_BORDER * 2.0))),
-            (ResizeDirection::SouthEast, Rect::from_min_size(win_rect.max - Vec2::splat(RESIZE_BORDER), Vec2::splat(RESIZE_BORDER))),
-            (ResizeDirection::South,     Rect::from_min_size(Pos2::new(win_rect.min.x + RESIZE_BORDER, win_rect.max.y - RESIZE_BORDER), Vec2::new(win_rect.width() - RESIZE_BORDER * 2.0, RESIZE_BORDER))),
-            (ResizeDirection::SouthWest, Rect::from_min_size(Pos2::new(win_rect.min.x, win_rect.max.y - RESIZE_BORDER), Vec2::splat(RESIZE_BORDER))),
-            (ResizeDirection::West,      Rect::from_min_size(Pos2::new(win_rect.min.x, win_rect.min.y + RESIZE_BORDER), Vec2::new(RESIZE_BORDER, win_rect.height() - RESIZE_BORDER * 2.0))),
+            (
+                ResizeDirection::NorthWest,
+                Rect::from_min_size(win_rect.min, Vec2::splat(RESIZE_BORDER)),
+            ),
+            (
+                ResizeDirection::North,
+                Rect::from_min_size(
+                    Pos2::new(win_rect.min.x + RESIZE_BORDER, win_rect.min.y),
+                    Vec2::new(win_rect.width() - RESIZE_BORDER * 2.0, RESIZE_BORDER),
+                ),
+            ),
+            (
+                ResizeDirection::NorthEast,
+                Rect::from_min_size(
+                    Pos2::new(win_rect.max.x - RESIZE_BORDER, win_rect.min.y),
+                    Vec2::splat(RESIZE_BORDER),
+                ),
+            ),
+            (
+                ResizeDirection::East,
+                Rect::from_min_size(
+                    Pos2::new(
+                        win_rect.max.x - RESIZE_BORDER,
+                        win_rect.min.y + RESIZE_BORDER,
+                    ),
+                    Vec2::new(RESIZE_BORDER, win_rect.height() - RESIZE_BORDER * 2.0),
+                ),
+            ),
+            (
+                ResizeDirection::SouthEast,
+                Rect::from_min_size(
+                    win_rect.max - Vec2::splat(RESIZE_BORDER),
+                    Vec2::splat(RESIZE_BORDER),
+                ),
+            ),
+            (
+                ResizeDirection::South,
+                Rect::from_min_size(
+                    Pos2::new(
+                        win_rect.min.x + RESIZE_BORDER,
+                        win_rect.max.y - RESIZE_BORDER,
+                    ),
+                    Vec2::new(win_rect.width() - RESIZE_BORDER * 2.0, RESIZE_BORDER),
+                ),
+            ),
+            (
+                ResizeDirection::SouthWest,
+                Rect::from_min_size(
+                    Pos2::new(win_rect.min.x, win_rect.max.y - RESIZE_BORDER),
+                    Vec2::splat(RESIZE_BORDER),
+                ),
+            ),
+            (
+                ResizeDirection::West,
+                Rect::from_min_size(
+                    Pos2::new(win_rect.min.x, win_rect.min.y + RESIZE_BORDER),
+                    Vec2::new(RESIZE_BORDER, win_rect.height() - RESIZE_BORDER * 2.0),
+                ),
+            ),
         ];
 
         // Use an Area that covers the full window for resize zones
@@ -93,7 +181,11 @@ impl eframe::App for QrFrameApp {
             .show(ctx, |ui| {
                 for (dir, rect) in dirs {
                     let cursor = resize_cursor(*dir);
-                    let resp = ui.interact(*rect, egui::Id::new(format!("resize_{:?}", dir)), egui::Sense::drag());
+                    let resp = ui.interact(
+                        *rect,
+                        egui::Id::new(format!("resize_{:?}", dir)),
+                        egui::Sense::drag(),
+                    );
                     if resp.hovered() {
                         ctx.set_cursor_icon(cursor);
                     }
@@ -130,7 +222,8 @@ impl eframe::App for QrFrameApp {
                         let btn_size = Vec2::new(28.0, 28.0);
 
                         // Close button — turns red on hover
-                        let (close_rect, close) = ui.allocate_exact_size(btn_size, egui::Sense::click());
+                        let (close_rect, close) =
+                            ui.allocate_exact_size(btn_size, egui::Sense::click());
                         let close_color = if close.hovered() {
                             ctx.set_cursor_icon(CursorIcon::PointingHand);
                             Color32::from_rgb(255, 68, 85)
@@ -151,7 +244,8 @@ impl eframe::App for QrFrameApp {
                         ui.add_space(4.0);
 
                         // Minimize button — turns white on hover
-                        let (mini_rect, mini) = ui.allocate_exact_size(btn_size, egui::Sense::click());
+                        let (mini_rect, mini) =
+                            ui.allocate_exact_size(btn_size, egui::Sense::click());
                         let mini_color = if mini.hovered() {
                             ctx.set_cursor_icon(CursorIcon::PointingHand);
                             Color32::from_rgb(224, 224, 224)
@@ -224,13 +318,24 @@ impl eframe::App for QrFrameApp {
 
                 ui.add_space(6.0);
 
-                let copied = state.copied_until.map(|t| t > Instant::now()).unwrap_or(false);
+                let copied = state
+                    .copied_until
+                    .map(|t| t > Instant::now())
+                    .unwrap_or(false);
                 let (btn_text, btn_color, btn_bg) = if copied {
                     ("✓  COPIED!", Color32::WHITE, Color32::from_rgb(0, 42, 24))
                 } else if state.decoded.is_empty() {
-                    ("⎘  COPY TO CLIPBOARD", Color32::from_rgb(42, 42, 42), Color32::from_rgb(20, 20, 20))
+                    (
+                        "⎘  COPY TO CLIPBOARD",
+                        Color32::from_rgb(42, 42, 42),
+                        Color32::from_rgb(20, 20, 20),
+                    )
                 } else {
-                    ("⎘  COPY TO CLIPBOARD", Color32::from_rgb(0, 232, 122), Color32::from_rgb(20, 20, 20))
+                    (
+                        "⎘  COPY TO CLIPBOARD",
+                        Color32::from_rgb(0, 232, 122),
+                        Color32::from_rgb(20, 20, 20),
+                    )
                 };
 
                 let btn = egui::Button::new(
@@ -263,8 +368,15 @@ impl eframe::App for QrFrameApp {
                     Color32::from_rgba_premultiplied(13, 26, 18, 60),
                 );
 
-                let flashing = state.flash_until.map(|t| t > Instant::now()).unwrap_or(false);
-                let corner_color = if flashing { Color32::WHITE } else { Color32::from_rgb(0, 232, 122) };
+                let flashing = state
+                    .flash_until
+                    .map(|t| t > Instant::now())
+                    .unwrap_or(false);
+                let corner_color = if flashing {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(0, 232, 122)
+                };
                 draw_corners(ui.painter(), available, corner_color, 24.0, 2.0);
 
                 let (status_text, status_color) = if state.decoded.is_empty() {
@@ -280,21 +392,13 @@ impl eframe::App for QrFrameApp {
                     status_color,
                 );
 
-                // Pass viewfinder screen coords to scan thread
-                let ppp = ctx.pixels_per_point();
-                let r = available;
-                *self.vf_rect.lock().unwrap() = Some([
-                    (r.min.x * ppp) as i32,
-                    (r.min.y * ppp) as i32,
-                    (r.width() * ppp) as i32,
-                    (r.height() * ppp) as i32,
-                ]);
-
-                if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-                    *self.win_pos.lock().unwrap() = Some([
-                        (outer.min.x * ppp) as i32,
-                        (outer.min.y * ppp) as i32,
-                    ]);
+                if let Some(window_rect) =
+                    ctx.input(|i| i.viewport().inner_rect.or(i.viewport().outer_rect))
+                {
+                    // Keep the capture area in logical desktop points. The screenshots crate
+                    // applies each platform's DPI rules internally.
+                    *self.capture_rect.lock().unwrap() =
+                        Some(CaptureArea::from_viewfinder(window_rect.min, available));
                 }
             });
     }
@@ -303,10 +407,10 @@ impl eframe::App for QrFrameApp {
 // ── Map resize direction to cursor icon ───────────────────────────
 fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     match dir {
-        ResizeDirection::North     => CursorIcon::ResizeNorth,
-        ResizeDirection::South     => CursorIcon::ResizeSouth,
-        ResizeDirection::East      => CursorIcon::ResizeEast,
-        ResizeDirection::West      => CursorIcon::ResizeWest,
+        ResizeDirection::North => CursorIcon::ResizeNorth,
+        ResizeDirection::South => CursorIcon::ResizeSouth,
+        ResizeDirection::East => CursorIcon::ResizeEast,
+        ResizeDirection::West => CursorIcon::ResizeWest,
         ResizeDirection::NorthWest => CursorIcon::ResizeNorthWest,
         ResizeDirection::NorthEast => CursorIcon::ResizeNorthEast,
         ResizeDirection::SouthWest => CursorIcon::ResizeSouthWest,
@@ -320,61 +424,113 @@ fn draw_corners(painter: &egui::Painter, rect: Rect, color: Color32, arm: f32, w
     let min = rect.min;
     let max = rect.max;
     let pad = 4.0;
-    painter.line_segment([Pos2::new(min.x+pad, min.y+pad+arm), Pos2::new(min.x+pad, min.y+pad)], stroke);
-    painter.line_segment([Pos2::new(min.x+pad, min.y+pad), Pos2::new(min.x+pad+arm, min.y+pad)], stroke);
-    painter.line_segment([Pos2::new(max.x-pad-arm, min.y+pad), Pos2::new(max.x-pad, min.y+pad)], stroke);
-    painter.line_segment([Pos2::new(max.x-pad, min.y+pad), Pos2::new(max.x-pad, min.y+pad+arm)], stroke);
-    painter.line_segment([Pos2::new(min.x+pad, max.y-pad-arm), Pos2::new(min.x+pad, max.y-pad)], stroke);
-    painter.line_segment([Pos2::new(min.x+pad, max.y-pad), Pos2::new(min.x+pad+arm, max.y-pad)], stroke);
-    painter.line_segment([Pos2::new(max.x-pad, max.y-pad-arm), Pos2::new(max.x-pad, max.y-pad)], stroke);
-    painter.line_segment([Pos2::new(max.x-pad, max.y-pad), Pos2::new(max.x-pad-arm, max.y-pad)], stroke);
+    painter.line_segment(
+        [
+            Pos2::new(min.x + pad, min.y + pad + arm),
+            Pos2::new(min.x + pad, min.y + pad),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(min.x + pad, min.y + pad),
+            Pos2::new(min.x + pad + arm, min.y + pad),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(max.x - pad - arm, min.y + pad),
+            Pos2::new(max.x - pad, min.y + pad),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(max.x - pad, min.y + pad),
+            Pos2::new(max.x - pad, min.y + pad + arm),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(min.x + pad, max.y - pad - arm),
+            Pos2::new(min.x + pad, max.y - pad),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(min.x + pad, max.y - pad),
+            Pos2::new(min.x + pad + arm, max.y - pad),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(max.x - pad, max.y - pad - arm),
+            Pos2::new(max.x - pad, max.y - pad),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(max.x - pad, max.y - pad),
+            Pos2::new(max.x - pad - arm, max.y - pad),
+        ],
+        stroke,
+    );
 }
 
 // ── Scan thread ────────────────────────────────────────────────────
-fn scan_loop(
-    state: Arc<Mutex<ScanState>>,
-    vf_rect: VfRect,
-    win_pos: WinPos,
-    ctx: egui::Context,
-) {
+fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui::Context) {
     loop {
         thread::sleep(Duration::from_millis(150));
 
-        let rect = match *vf_rect.lock().unwrap() { Some(r) => r, None => continue };
-        let wpos = match *win_pos.lock().unwrap() { Some(p) => p, None => continue };
+        let capture_area = match *capture_rect.lock().unwrap() {
+            Some(r) => r,
+            None => continue,
+        };
 
-        let abs_x = wpos[0] + rect[0];
-        let abs_y = wpos[1] + rect[1];
-        let abs_w = rect[2] as u32;
-        let abs_h = rect[3] as u32;
+        if capture_area.width < 10 || capture_area.height < 10 {
+            continue;
+        }
 
-        if abs_w < 10 || abs_h < 10 { continue; }
+        let (anchor_x, anchor_y) = capture_area.anchor_point();
+        let screen = match Screen::from_point(anchor_x, anchor_y).ok().or_else(|| {
+            Screen::all()
+                .ok()
+                .and_then(|screens| screens.first().cloned())
+        }) {
+            Some(screen) => screen,
+            None => continue,
+        };
 
-        let screens = match Screen::all() { Ok(s) => s, Err(_) => continue };
-        let screen = screens.iter()
-            .find(|s| {
-                let i = s.display_info;
-                abs_x >= i.x && abs_y >= i.y
-                    && abs_x < i.x + i.width as i32
-                    && abs_y < i.y + i.height as i32
-            })
-            .or_else(|| screens.first())
-            .cloned();
-
-        let screen = match screen { Some(s) => s, None => continue };
-
-        let screenshot = match screen.capture_area(abs_x, abs_y, abs_w, abs_h) {
+        let capture_area =
+            capture_area.relative_to_origin(screen.display_info.x, screen.display_info.y);
+        let screenshot = match screen.capture_area(
+            capture_area.x,
+            capture_area.y,
+            capture_area.width,
+            capture_area.height,
+        ) {
             Ok(s) => s,
             Err(_) => continue,
         };
 
-        let sw  = screenshot.width() as usize;
+        let capture_width = screenshot.width();
+        let capture_height = screenshot.height();
+        if capture_width < 10 || capture_height < 10 {
+            continue;
+        }
+
+        let sw = capture_width as usize;
         let raw = screenshot.as_raw();
 
-        let luma: GrayImage = ImageBuffer::from_fn(abs_w, abs_h, |px, py| {
+        let luma: GrayImage = ImageBuffer::from_fn(capture_width, capture_height, |px, py| {
             let idx = (py as usize * sw + px as usize) * 4;
             if idx + 2 < raw.len() {
-                let r = raw[idx]     as u32;
+                let r = raw[idx] as u32;
                 let g = raw[idx + 1] as u32;
                 let b = raw[idx + 2] as u32;
                 Luma([((r * 77 + g * 150 + b * 29) >> 8) as u8])
@@ -401,48 +557,65 @@ fn scan_loop(
 
 // ── Decode pipeline ────────────────────────────────────────────────
 fn try_decode_variants(gray: &GrayImage) -> Option<String> {
-    if let Some(r) = decode_luma(gray)                       { return Some(r); }
+    if let Some(r) = decode_luma(gray) {
+        return Some(r);
+    }
     let stretched = contrast_stretch(gray);
-    if let Some(r) = decode_luma(&stretched)                 { return Some(r); }
+    if let Some(r) = decode_luma(&stretched) {
+        return Some(r);
+    }
     let inverted = invert_luma(gray);
-    if let Some(r) = decode_luma(&inverted)                  { return Some(r); }
-    if let Some(r) = decode_luma(&contrast_stretch(&inverted)) { return Some(r); }
+    if let Some(r) = decode_luma(&inverted) {
+        return Some(r);
+    }
+    if let Some(r) = decode_luma(&contrast_stretch(&inverted)) {
+        return Some(r);
+    }
     let thresh = threshold_luma(gray, 128);
-    if let Some(r) = decode_luma(&thresh)                    { return Some(r); }
-    if let Some(r) = decode_luma(&invert_luma(&thresh))      { return Some(r); }
+    if let Some(r) = decode_luma(&thresh) {
+        return Some(r);
+    }
+    if let Some(r) = decode_luma(&invert_luma(&thresh)) {
+        return Some(r);
+    }
     let (w, h) = gray.dimensions();
     if w < 600 && h < 600 {
         let up = upscale_2x(gray);
-        if let Some(r) = decode_luma(&up)                    { return Some(r); }
-        if let Some(r) = decode_luma(&contrast_stretch(&up)) { return Some(r); }
+        if let Some(r) = decode_luma(&up) {
+            return Some(r);
+        }
+        if let Some(r) = decode_luma(&contrast_stretch(&up)) {
+            return Some(r);
+        }
     }
     None
 }
 
 fn decode_luma(img: &GrayImage) -> Option<String> {
     let dyn_img = DynamicImage::ImageLuma8(img.clone());
-    let source  = BufferedImageLuminanceSource::new(dyn_img);
-    let bitmap  = BinaryBitmap::new(HybridBinarizer::new(source));
+    let source = BufferedImageLuminanceSource::new(dyn_img);
+    let bitmap = BinaryBitmap::new(HybridBinarizer::new(source));
     let mut hints = rxing::DecodingHintDictionary::default();
     hints.insert(
         DecodeHintType::POSSIBLE_FORMATS,
-        DecodeHintValue::PossibleFormats(
-            [rxing::BarcodeFormat::QR_CODE].iter().cloned().collect(),
-        ),
+        DecodeHintValue::PossibleFormats([rxing::BarcodeFormat::QR_CODE].iter().cloned().collect()),
     );
     hints.insert(DecodeHintType::TRY_HARDER, DecodeHintValue::TryHarder(true));
     let mut reader = MultiFormatReader::default();
-    reader.decode_with_hints(&mut bitmap.into(), &hints)
+    reader
+        .decode_with_hints(&mut bitmap.into(), &hints)
         .ok()
         .map(|r| r.getText().to_string())
         .filter(|s| !s.is_empty())
 }
 
 fn contrast_stretch(img: &GrayImage) -> GrayImage {
-    let (min_v, max_v) = img.pixels().fold((255u8, 0u8), |(mn, mx), p| {
-        (mn.min(p[0]), mx.max(p[0]))
-    });
-    if max_v == min_v { return img.clone(); }
+    let (min_v, max_v) = img
+        .pixels()
+        .fold((255u8, 0u8), |(mn, mx), p| (mn.min(p[0]), mx.max(p[0])));
+    if max_v == min_v {
+        return img.clone();
+    }
     let range = (max_v - min_v) as f32;
     ImageBuffer::from_fn(img.width(), img.height(), |x, y| {
         let v = img.get_pixel(x, y)[0];
@@ -458,15 +631,70 @@ fn invert_luma(img: &GrayImage) -> GrayImage {
 
 fn threshold_luma(img: &GrayImage, thresh: u8) -> GrayImage {
     ImageBuffer::from_fn(img.width(), img.height(), |x, y| {
-        Luma([if img.get_pixel(x, y)[0] > thresh { 255 } else { 0 }])
+        Luma([if img.get_pixel(x, y)[0] > thresh {
+            255
+        } else {
+            0
+        }])
     })
 }
 
 fn upscale_2x(img: &GrayImage) -> GrayImage {
     let (w, h) = img.dimensions();
-    ImageBuffer::from_fn(w * 2, h * 2, |x, y| {
-        *img.get_pixel(x / 2, y / 2)
-    })
+    ImageBuffer::from_fn(w * 2, h * 2, |x, y| *img.get_pixel(x / 2, y / 2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_area_uses_logical_window_points() {
+        let window_min = Pos2::new(100.0, 200.0);
+        let viewfinder = Rect::from_min_max(Pos2::new(24.2, 48.8), Pos2::new(324.1, 348.1));
+
+        assert_eq!(
+            CaptureArea::from_viewfinder(window_min, viewfinder),
+            CaptureArea {
+                x: 124,
+                y: 248,
+                width: 300,
+                height: 300,
+            }
+        );
+    }
+
+    #[test]
+    fn capture_area_converts_to_monitor_relative_coordinates() {
+        let area = CaptureArea {
+            x: 2200,
+            y: 180,
+            width: 320,
+            height: 240,
+        };
+
+        assert_eq!(
+            area.relative_to_origin(1920, 0),
+            CaptureArea {
+                x: 280,
+                y: 180,
+                width: 320,
+                height: 240,
+            }
+        );
+    }
+
+    #[test]
+    fn capture_area_anchor_point_uses_the_center() {
+        let area = CaptureArea {
+            x: 1920,
+            y: 100,
+            width: 321,
+            height: 241,
+        };
+
+        assert_eq!(area.anchor_point(), (2080, 220));
+    }
 }
 
 // ── Entry point ────────────────────────────────────────────────────
