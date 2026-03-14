@@ -24,6 +24,7 @@ struct ScanState {
     decoded: String,
     flash_until: Option<Instant>,
     copied_until: Option<Instant>,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,13 +270,13 @@ impl eframe::App for QrFrameApp {
                 });
 
                 // Drag title bar to move window — only the area LEFT of the buttons
-                let titlebar_rect = ui.min_rect();
+                let titlebar_rect = ui.max_rect();
                 let drag_rect = Rect::from_min_max(
                     titlebar_rect.min,
                     Pos2::new(buttons_min_x, titlebar_rect.max.y),
                 );
-                let drag = ui.interact(drag_rect, title_id, egui::Sense::drag());
-                if drag.dragged() {
+                let drag = ui.interact(drag_rect, title_id, egui::Sense::click_and_drag());
+                if drag.is_pointer_button_down_on() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
             });
@@ -379,7 +380,11 @@ impl eframe::App for QrFrameApp {
                 };
                 draw_corners(ui.painter(), available, corner_color, 24.0, 2.0);
 
-                let (status_text, status_color) = if state.decoded.is_empty() {
+                let error_str;
+                let (status_text, status_color) = if let Some(err) = state.last_error.as_deref() {
+                    error_str = format!("Err: {}", err);
+                    (error_str.as_str(), Color32::from_rgb(255, 68, 85))
+                } else if state.decoded.is_empty() {
                     ("Scanning screen…", Color32::from_rgb(56, 56, 56))
                 } else {
                     ("✓  QR detected", Color32::from_rgb(0, 232, 122))
@@ -503,7 +508,12 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
                 .and_then(|screens| screens.first().cloned())
         }) {
             Some(screen) => screen,
-            None => continue,
+            None => {
+                let mut s = state.lock().unwrap();
+                s.last_error = Some("No screen found at window".into());
+                ctx.request_repaint();
+                continue;
+            }
         };
 
         let capture_area =
@@ -515,8 +525,21 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
             capture_area.height,
         ) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                let mut s = state.lock().unwrap();
+                s.last_error = Some(format!("Capture err: {}", e));
+                ctx.request_repaint();
+                continue;
+            }
         };
+        
+        {
+            let mut s = state.lock().unwrap();
+            if s.last_error.is_some() {
+                s.last_error = None;
+                ctx.request_repaint();
+            }
+        }
 
         let capture_width = screenshot.width();
         let capture_height = screenshot.height();
@@ -526,6 +549,14 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
 
         let sw = capture_width as usize;
         let raw = screenshot.as_raw();
+        
+        let _ = image::save_buffer(
+            "/tmp/qr_debug.png",
+            raw,
+            capture_width as u32,
+            capture_height as u32,
+            image::ColorType::Rgba8
+        );
 
         let luma: GrayImage = ImageBuffer::from_fn(capture_width, capture_height, |px, py| {
             let idx = (py as usize * sw + px as usize) * 4;
