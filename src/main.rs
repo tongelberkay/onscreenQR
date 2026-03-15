@@ -520,21 +520,21 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
             }
         };
 
-        // On Wayland, display_info.x/y are always 0 and capture_area already holds
-        // absolute screen-space coordinates that the screenshots crate expects.
-        // On X11 / Windows / macOS, non-zero origins mean we must subtract the
-        // screen's origin to get monitor-relative coordinates.
-        let capture_area = if screen.display_info.x == 0 && screen.display_info.y == 0 {
+        // On Wayland with XDG desktop portal (e.g. KDE/GNOME), capture_area() feeds
+        // desktop-space pixel coordinates into a PipeWire stream that always starts at
+        // (0,0), so the crop lands in the wrong place or fails entirely.  The safe
+        // approach for all platforms is to capture the full screen and crop in software.
+        // On X11 / Windows / macOS the portal is not used so direct capture_area() would
+        // also work, but capturing the full screen and cropping is equally correct there.
+        //
+        // Convert to monitor-relative coordinates for platforms that need it.
+        let crop = if screen.display_info.x == 0 && screen.display_info.y == 0 {
             capture_area
         } else {
             capture_area.relative_to_origin(screen.display_info.x, screen.display_info.y)
         };
-        let screenshot = match screen.capture_area(
-            capture_area.x,
-            capture_area.y,
-            capture_area.width,
-            capture_area.height,
-        ) {
+
+        let full_shot = match screen.capture() {
             Ok(s) => s,
             Err(e) => {
                 let mut s = state.lock().unwrap();
@@ -543,7 +543,7 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
                 continue;
             }
         };
-        
+
         {
             let mut s = state.lock().unwrap();
             if s.last_error.is_some() {
@@ -552,14 +552,33 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
             }
         }
 
-        let capture_width = screenshot.width();
-        let capture_height = screenshot.height();
-        if capture_width < 10 || capture_height < 10 {
+        // Clamp crop rect to actual screenshot dimensions so we never panic.
+        let full_width = full_shot.width();
+        let full_height = full_shot.height();
+        let crop_x = crop.x.max(0) as u32;
+        let crop_y = crop.y.max(0) as u32;
+        let crop_w = crop.width.min(full_width.saturating_sub(crop_x));
+        let crop_h = crop.height.min(full_height.saturating_sub(crop_y));
+        if crop_w < 10 || crop_h < 10 {
             continue;
         }
 
+        // Manually crop from the full-screen RGBA buffer.
+        let full_raw = full_shot.as_raw();
+        let full_stride = full_width as usize * 4;
+        let capture_width = crop_w;
+        let capture_height = crop_h;
+        let mut cropped: Vec<u8> = Vec::with_capacity((crop_w * crop_h * 4) as usize);
+        for row in 0..crop_h {
+            let src_y = crop_y + row;
+            let src_start = src_y as usize * full_stride + crop_x as usize * 4;
+            let src_end = src_start + crop_w as usize * 4;
+            if src_end <= full_raw.len() {
+                cropped.extend_from_slice(&full_raw[src_start..src_end]);
+            }
+        }
+        let raw = cropped.as_slice();
         let sw = capture_width as usize;
-        let raw = screenshot.as_raw();
         
         let luma: GrayImage = ImageBuffer::from_fn(capture_width, capture_height, |px, py| {
             let idx = (py as usize * sw + px as usize) * 4;
