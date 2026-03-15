@@ -397,14 +397,18 @@ impl eframe::App for QrFrameApp {
                     status_color,
                 );
 
-                if let Some(window_rect) =
-                    ctx.input(|i| i.viewport().inner_rect.or(i.viewport().outer_rect))
-                {
-                    // Keep the capture area in logical desktop points. The screenshots crate
-                    // applies each platform's DPI rules internally.
-                    *self.capture_rect.lock().unwrap() =
-                        Some(CaptureArea::from_viewfinder(window_rect.min, available));
-                }
+                // inner_rect / outer_rect are Some on X11, Windows and macOS, giving us the
+                // true desktop-space origin of the window.  On Wayland compositors the window
+                // position is intentionally hidden, so both fields come back as None.
+                // In that case we fall back to Pos2::ZERO: the screenshots crate on Wayland
+                // captures starting at (0,0), and egui viewport coordinates are already
+                // relative to (0,0) so no adjustment is needed.
+                let window_origin = ctx
+                    .input(|i| i.viewport().inner_rect.or(i.viewport().outer_rect))
+                    .map(|r| r.min)
+                    .unwrap_or(Pos2::ZERO);
+                *self.capture_rect.lock().unwrap() =
+                    Some(CaptureArea::from_viewfinder(window_origin, available));
             });
     }
 }
@@ -516,8 +520,15 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
             }
         };
 
-        let capture_area =
-            capture_area.relative_to_origin(screen.display_info.x, screen.display_info.y);
+        // On Wayland, display_info.x/y are always 0 and capture_area already holds
+        // absolute screen-space coordinates that the screenshots crate expects.
+        // On X11 / Windows / macOS, non-zero origins mean we must subtract the
+        // screen's origin to get monitor-relative coordinates.
+        let capture_area = if screen.display_info.x == 0 && screen.display_info.y == 0 {
+            capture_area
+        } else {
+            capture_area.relative_to_origin(screen.display_info.x, screen.display_info.y)
+        };
         let screenshot = match screen.capture_area(
             capture_area.x,
             capture_area.y,
@@ -550,14 +561,6 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
         let sw = capture_width as usize;
         let raw = screenshot.as_raw();
         
-        let _ = image::save_buffer(
-            "/tmp/qr_debug.png",
-            raw,
-            capture_width as u32,
-            capture_height as u32,
-            image::ColorType::Rgba8
-        );
-
         let luma: GrayImage = ImageBuffer::from_fn(capture_width, capture_height, |px, py| {
             let idx = (py as usize * sw + px as usize) * 4;
             if idx + 2 < raw.len() {
