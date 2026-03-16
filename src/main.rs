@@ -113,6 +113,9 @@ impl QrFrameApp {
 
 // ── Resize border thickness (logical pixels) ──────────────────────
 const RESIZE_BORDER: f32 = 6.0;
+const APP_ID: &str = "com.berkay.qr-frame";
+const APP_TITLE: &str = "QR Frame";
+const WAYLAND_FALLBACK_SCAN_INTERVAL: Duration = Duration::from_millis(1200);
 
 impl eframe::App for QrFrameApp {
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
@@ -510,6 +513,8 @@ fn draw_corners(painter: &egui::Painter, rect: Rect, color: Color32, arm: f32, w
 
 // ── Scan thread ────────────────────────────────────────────────────
 fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui::Context) {
+    let mut last_wayland_fallback_scan = Instant::now() - WAYLAND_FALLBACK_SCAN_INTERVAL;
+
     loop {
         thread::sleep(Duration::from_millis(150));
 
@@ -557,6 +562,11 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
                 }
             }
         } else {
+            if last_wayland_fallback_scan.elapsed() < WAYLAND_FALLBACK_SCAN_INTERVAL {
+                continue;
+            }
+            last_wayland_fallback_scan = Instant::now();
+
             match scan_all_screens() {
                 Ok(Some((decoded, had_capture))) => {
                     if had_capture {
@@ -828,7 +838,8 @@ mod tests {
 fn main() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("QR Frame")
+            .with_title(APP_TITLE)
+            .with_app_id(APP_ID)
             .with_inner_size([380.0, 480.0])
             .with_min_inner_size([300.0, 400.0])
             .with_decorations(false)
@@ -839,7 +850,7 @@ fn main() {
     };
 
     eframe::run_native(
-        "QR Frame",
+        APP_ID,
         options,
         Box::new(|cc| Ok(Box::new(QrFrameApp::new(cc)))),
     )

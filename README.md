@@ -30,6 +30,10 @@ cargo build --release
 # output: target/release/qr-frame
 ```
 
+On KDE/GNOME Wayland, install or launch the app through the included
+`com.berkay.qr-frame.desktop` entry so the compositor can associate screen
+capture permissions with a stable app id.
+
 **Manual:**
 ```
 cargo build --release

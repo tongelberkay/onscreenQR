@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=QR Frame
+Comment=Always-on-top QR code reader
+Exec=qr-frame
+Icon=applications-graphics
+Terminal=false
+Categories=Utility;Graphics;
+StartupNotify=true
+StartupWMClass=QR Frame
