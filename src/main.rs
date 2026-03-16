@@ -60,9 +60,24 @@ impl CaptureArea {
             height: self.height,
         }
     }
+
+    fn scale(self, scale_factor: f32) -> Self {
+        Self {
+            x: ((self.x as f32) * scale_factor).floor() as i32,
+            y: ((self.y as f32) * scale_factor).floor() as i32,
+            width: ((self.width as f32) * scale_factor).ceil() as u32,
+            height: ((self.height as f32) * scale_factor).ceil() as u32,
+        }
+    }
 }
 
-type CaptureRect = Arc<Mutex<Option<CaptureArea>>>;
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CaptureRequest {
+    area: CaptureArea,
+    window_origin_known: bool,
+}
+
+type CaptureRect = Arc<Mutex<Option<CaptureRequest>>>;
 
 struct QrFrameApp {
     state: Arc<Mutex<ScanState>>,
@@ -398,17 +413,19 @@ impl eframe::App for QrFrameApp {
                 );
 
                 // inner_rect / outer_rect are Some on X11, Windows and macOS, giving us the
-                // true desktop-space origin of the window.  On Wayland compositors the window
-                // position is intentionally hidden, so both fields come back as None.
-                // In that case we fall back to Pos2::ZERO: the screenshots crate on Wayland
-                // captures starting at (0,0), and egui viewport coordinates are already
-                // relative to (0,0) so no adjustment is needed.
-                let window_origin = ctx
-                    .input(|i| i.viewport().inner_rect.or(i.viewport().outer_rect))
-                    .map(|r| r.min)
-                    .unwrap_or(Pos2::ZERO);
-                *self.capture_rect.lock().unwrap() =
-                    Some(CaptureArea::from_viewfinder(window_origin, available));
+                // true desktop-space origin of the window. On Wayland compositors the window
+                // position is intentionally hidden, so both fields can come back as None.
+                // We still record the local viewfinder size, then let the scan loop switch to
+                // a full-screen fallback instead of sampling the wrong desktop coordinates.
+                let window_origin =
+                    ctx.input(|i| i.viewport().inner_rect.or(i.viewport().outer_rect));
+                *self.capture_rect.lock().unwrap() = Some(CaptureRequest {
+                    area: CaptureArea::from_viewfinder(
+                        window_origin.map(|r| r.min).unwrap_or(Pos2::ZERO),
+                        available,
+                    ),
+                    window_origin_known: window_origin.is_some(),
+                });
             });
     }
 }
@@ -496,103 +513,66 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
     loop {
         thread::sleep(Duration::from_millis(150));
 
-        let capture_area = match *capture_rect.lock().unwrap() {
+        let capture_request = match *capture_rect.lock().unwrap() {
             Some(r) => r,
             None => continue,
         };
+        let capture_area = capture_request.area;
 
         if capture_area.width < 10 || capture_area.height < 10 {
             continue;
         }
 
-        let (anchor_x, anchor_y) = capture_area.anchor_point();
-        let screen = match Screen::from_point(anchor_x, anchor_y).ok().or_else(|| {
-            Screen::all()
-                .ok()
-                .and_then(|screens| screens.first().cloned())
-        }) {
-            Some(screen) => screen,
-            None => {
-                let mut s = state.lock().unwrap();
-                s.last_error = Some("No screen found at window".into());
-                ctx.request_repaint();
-                continue;
-            }
-        };
+        let decoded = if capture_request.window_origin_known {
+            let (anchor_x, anchor_y) = capture_area.anchor_point();
+            let screen = match Screen::from_point(anchor_x, anchor_y).ok().or_else(|| {
+                Screen::all()
+                    .ok()
+                    .and_then(|screens| screens.first().cloned())
+            }) {
+                Some(screen) => screen,
+                None => {
+                    let mut s = state.lock().unwrap();
+                    s.last_error = Some("No screen found at window".into());
+                    ctx.request_repaint();
+                    continue;
+                }
+            };
 
-        // On Wayland with XDG desktop portal (e.g. KDE/GNOME), capture_area() feeds
-        // desktop-space pixel coordinates into a PipeWire stream that always starts at
-        // (0,0), so the crop lands in the wrong place or fails entirely.  The safe
-        // approach for all platforms is to capture the full screen and crop in software.
-        // On X11 / Windows / macOS the portal is not used so direct capture_area() would
-        // also work, but capturing the full screen and cropping is equally correct there.
-        //
-        // Convert to monitor-relative coordinates for platforms that need it.
-        let crop = if screen.display_info.x == 0 && screen.display_info.y == 0 {
-            capture_area
+            let crop = capture_area
+                .relative_to_origin(screen.display_info.x, screen.display_info.y)
+                .scale(screen.display_info.scale_factor);
+
+            match capture_luma(&screen, Some(crop)) {
+                Ok(Some(luma)) => {
+                    clear_capture_error(&state, &ctx);
+                    try_decode_variants(&luma)
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.last_error = Some(format!("Capture err: {}", e));
+                    ctx.request_repaint();
+                    continue;
+                }
+            }
         } else {
-            capture_area.relative_to_origin(screen.display_info.x, screen.display_info.y)
-        };
-
-        let full_shot = match screen.capture() {
-            Ok(s) => s,
-            Err(e) => {
-                let mut s = state.lock().unwrap();
-                s.last_error = Some(format!("Capture err: {}", e));
-                ctx.request_repaint();
-                continue;
+            match scan_all_screens() {
+                Ok(Some((decoded, had_capture))) => {
+                    if had_capture {
+                        clear_capture_error(&state, &ctx);
+                    }
+                    decoded
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.last_error = Some(format!("Capture err: {}", e));
+                    ctx.request_repaint();
+                    continue;
+                }
             }
         };
-
-        {
-            let mut s = state.lock().unwrap();
-            if s.last_error.is_some() {
-                s.last_error = None;
-                ctx.request_repaint();
-            }
-        }
-
-        // Clamp crop rect to actual screenshot dimensions so we never panic.
-        let full_width = full_shot.width();
-        let full_height = full_shot.height();
-        let crop_x = crop.x.max(0) as u32;
-        let crop_y = crop.y.max(0) as u32;
-        let crop_w = crop.width.min(full_width.saturating_sub(crop_x));
-        let crop_h = crop.height.min(full_height.saturating_sub(crop_y));
-        if crop_w < 10 || crop_h < 10 {
-            continue;
-        }
-
-        // Manually crop from the full-screen RGBA buffer.
-        let full_raw = full_shot.as_raw();
-        let full_stride = full_width as usize * 4;
-        let capture_width = crop_w;
-        let capture_height = crop_h;
-        let mut cropped: Vec<u8> = Vec::with_capacity((crop_w * crop_h * 4) as usize);
-        for row in 0..crop_h {
-            let src_y = crop_y + row;
-            let src_start = src_y as usize * full_stride + crop_x as usize * 4;
-            let src_end = src_start + crop_w as usize * 4;
-            if src_end <= full_raw.len() {
-                cropped.extend_from_slice(&full_raw[src_start..src_end]);
-            }
-        }
-        let raw = cropped.as_slice();
-        let sw = capture_width as usize;
-        
-        let luma: GrayImage = ImageBuffer::from_fn(capture_width, capture_height, |px, py| {
-            let idx = (py as usize * sw + px as usize) * 4;
-            if idx + 2 < raw.len() {
-                let r = raw[idx] as u32;
-                let g = raw[idx + 1] as u32;
-                let b = raw[idx + 2] as u32;
-                Luma([((r * 77 + g * 150 + b * 29) >> 8) as u8])
-            } else {
-                Luma([0u8])
-            }
-        });
-
-        let decoded = try_decode_variants(&luma);
 
         let mut s = state.lock().unwrap();
         if let Some(text) = decoded {
@@ -606,6 +586,80 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
             ctx.request_repaint();
         }
     }
+}
+
+fn clear_capture_error(state: &Arc<Mutex<ScanState>>, ctx: &egui::Context) {
+    let mut s = state.lock().unwrap();
+    if s.last_error.is_some() {
+        s.last_error = None;
+        ctx.request_repaint();
+    }
+}
+
+fn scan_all_screens() -> Result<Option<(Option<String>, bool)>, String> {
+    let screens = Screen::all().map_err(|e| e.to_string())?;
+    if screens.is_empty() {
+        return Ok(None);
+    }
+
+    let mut had_capture = false;
+    for screen in screens {
+        if let Some(luma) = capture_luma(&screen, None)? {
+            had_capture = true;
+            if let Some(decoded) = try_decode_variants(&luma) {
+                return Ok(Some((Some(decoded), true)));
+            }
+        }
+    }
+
+    Ok(Some((None, had_capture)))
+}
+
+fn capture_luma(screen: &Screen, crop: Option<CaptureArea>) -> Result<Option<GrayImage>, String> {
+    let full_shot = screen.capture().map_err(|e| e.to_string())?;
+    let full_width = full_shot.width();
+    let full_height = full_shot.height();
+
+    let crop = crop.unwrap_or(CaptureArea {
+        x: 0,
+        y: 0,
+        width: full_width,
+        height: full_height,
+    });
+
+    let crop_x = crop.x.max(0) as u32;
+    let crop_y = crop.y.max(0) as u32;
+    let crop_w = crop.width.min(full_width.saturating_sub(crop_x));
+    let crop_h = crop.height.min(full_height.saturating_sub(crop_y));
+    if crop_w < 10 || crop_h < 10 {
+        return Ok(None);
+    }
+
+    let full_raw = full_shot.as_raw();
+    let full_stride = full_width as usize * 4;
+    let mut cropped: Vec<u8> = Vec::with_capacity((crop_w * crop_h * 4) as usize);
+    for row in 0..crop_h {
+        let src_y = crop_y + row;
+        let src_start = src_y as usize * full_stride + crop_x as usize * 4;
+        let src_end = src_start + crop_w as usize * 4;
+        if src_end <= full_raw.len() {
+            cropped.extend_from_slice(&full_raw[src_start..src_end]);
+        }
+    }
+
+    let raw = cropped.as_slice();
+    let sw = crop_w as usize;
+    Ok(Some(ImageBuffer::from_fn(crop_w, crop_h, |px, py| {
+        let idx = (py as usize * sw + px as usize) * 4;
+        if idx + 2 < raw.len() {
+            let r = raw[idx] as u32;
+            let g = raw[idx + 1] as u32;
+            let b = raw[idx + 2] as u32;
+            Luma([((r * 77 + g * 150 + b * 29) >> 8) as u8])
+        } else {
+            Luma([0u8])
+        }
+    })))
 }
 
 // ── Decode pipeline ────────────────────────────────────────────────
@@ -747,6 +801,26 @@ mod tests {
         };
 
         assert_eq!(area.anchor_point(), (2080, 220));
+    }
+
+    #[test]
+    fn capture_area_scale_converts_logical_to_physical_pixels() {
+        let area = CaptureArea {
+            x: 140,
+            y: 80,
+            width: 301,
+            height: 201,
+        };
+
+        assert_eq!(
+            area.scale(1.5),
+            CaptureArea {
+                x: 210,
+                y: 120,
+                width: 452,
+                height: 302,
+            }
+        );
     }
 }
 

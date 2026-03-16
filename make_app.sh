@@ -7,7 +7,7 @@ APP="QR Frame.app"
 mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 
-cp target/release/qr-frame "$APP/Contents/MacOS/qr-frame"
+cp target/debug/qr-frame "$APP/Contents/MacOS/qr-frame"
 
 PLIST="$APP/Contents/Info.plist"
 
