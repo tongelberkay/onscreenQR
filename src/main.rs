@@ -1,7 +1,7 @@
 // src/main.rs
 // QR Frame Scanner — Rust / egui edition
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::sync::{Arc, Mutex};
 use std::thread;
