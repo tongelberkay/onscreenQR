@@ -22,7 +22,4 @@ echo.
 echo  [+] Done! Executable at:
 echo      target\release\qr-frame.exe
 echo.
-copy /Y "target\release\qr-frame.exe" "QR Frame Scanner.exe" >nul
-echo  [+] Copied to: QR Frame Scanner.exe
-echo.
 pause

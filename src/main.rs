@@ -834,6 +834,12 @@ mod tests {
     }
 }
 
+// ── Window/taskbar icon (Windows, macOS, Linux) ────────────────────
+fn load_icon() -> egui::IconData {
+    let bytes = include_bytes!("../assets/icon.png");
+    eframe::icon_data::from_png_bytes(bytes).expect("invalid icon PNG")
+}
+
 // ── Entry point ────────────────────────────────────────────────────
 fn main() {
     let options = eframe::NativeOptions {
@@ -845,7 +851,8 @@ fn main() {
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
-            .with_taskbar(true),
+            .with_taskbar(true)
+            .with_icon(load_icon()),
         ..Default::default()
     };
 
