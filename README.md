@@ -40,16 +40,6 @@ Output: `target/release/qr-frame` (`qr-frame.exe` on Windows).
 Linux dev packages (X11, Wayland, OpenGL, PipeWire, libclang) on apt/dnf.
 On macOS, `make_app.sh` wraps the binary into `QR Frame.app`.
 
-## Releasing
-
-CI builds every push and pull request on Windows, Linux and macOS. Pushing a
-version tag builds all platforms and publishes a GitHub Release:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
 ## Troubleshooting
 
 - **Windows: `An Application Control policy has blocked this file (os error 4551)` while building** —
