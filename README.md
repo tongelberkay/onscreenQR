@@ -6,6 +6,13 @@ Position the frame over any QR code on your screen → decoded text appears inst
 
 ---
 
+## Download
+
+Prebuilt binaries for Windows, Linux and macOS (Apple Silicon) are on the
+[Releases](https://github.com/tongelberkay/qrReader_rust/releases) page.
+
+---
+
 ## Requirements
 
 | Tool | Notes |
@@ -30,14 +37,39 @@ cargo build --release
 # output: target/release/qr-frame
 ```
 
-On KDE/GNOME Wayland, install or launch the app through the included
-`com.berkay.qr-frame.desktop` entry so the compositor can associate screen
-capture permissions with a stable app id.
+Linux needs the X11/Wayland/OpenGL dev packages — `build.sh` installs them
+on apt/dnf systems.
 
 **Manual:**
 ```
 cargo build --release
 ```
+
+---
+
+## Releasing
+
+CI builds every push to `main` and every pull request on Windows, Linux and macOS.
+
+To publish a release, push a version tag. GitHub Actions builds all platforms
+and attaches the binaries to a new GitHub Release:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+---
+
+## Troubleshooting
+
+- **Windows: `An Application Control policy has blocked this file (os error 4551)` while building** —
+  Smart App Control is blocking Cargo's build scripts. Turn it off in
+  Windows Security → App & browser control → Smart App Control.
+- **NVIDIA: frame is not transparent, app is detected as a game, system lags** —
+  in NVIDIA Control Panel → Manage 3D settings, set
+  **Vulkan/OpenGL present method** to **Auto** or **Prefer native**
+  (not *Prefer layered on DXGI Swapchain*).
 
 ---
 

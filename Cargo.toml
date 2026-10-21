@@ -12,7 +12,7 @@ egui = "0.31"
 screenshots = "0.8"
 
 # QR decoding — pure Rust ZXing port, no C++ / no DLL
-rxing = { version = "0.5", default-features = false, features = ["image_formats"] }
+rxing = { version = "0.5", default-features = false }
 
 # Image processing for decode pre-processing variants
 image = { version = "0.25", default-features = false, features = ["png"] }

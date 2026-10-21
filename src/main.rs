@@ -11,10 +11,10 @@ use arboard::Clipboard;
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, ResizeDirection, Stroke, Vec2,
 };
-use image::{DynamicImage, GrayImage, ImageBuffer, Luma};
+use image::{GrayImage, ImageBuffer, Luma};
 use rxing::{
-    common::HybridBinarizer, BinaryBitmap, BufferedImageLuminanceSource, DecodeHintType,
-    DecodeHintValue, MultiFormatReader, Reader,
+    common::HybridBinarizer, BinaryBitmap, DecodeHintType,
+    DecodeHintValue, Luma8LuminanceSource, MultiFormatReader, Reader,
 };
 use screenshots::Screen;
 
@@ -709,8 +709,7 @@ fn try_decode_variants(gray: &GrayImage) -> Option<String> {
 }
 
 fn decode_luma(img: &GrayImage) -> Option<String> {
-    let dyn_img = DynamicImage::ImageLuma8(img.clone());
-    let source = BufferedImageLuminanceSource::new(dyn_img);
+    let source = Luma8LuminanceSource::new(img.as_raw().clone(), img.width(), img.height());
     let bitmap = BinaryBitmap::new(HybridBinarizer::new(source));
     let mut hints = rxing::DecodingHintDictionary::default();
     hints.insert(
