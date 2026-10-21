@@ -91,7 +91,7 @@ async fn open_portal_stream() -> Result<(OwnedFd, u32), String> {
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(CursorMode::Hidden)
-                .set_sources(SourceType::Monitor)
+                .set_sources(Some(SourceType::Monitor.into()))
                 .set_multiple(false)
                 .set_persist_mode(PersistMode::ExplicitlyRevoked)
                 .set_restore_token(token.as_deref()),
