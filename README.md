@@ -37,8 +37,19 @@ cargo build --release
 # output: target/release/qr-frame
 ```
 
-Linux needs the X11/Wayland/OpenGL dev packages — `build.sh` installs them
-on apt/dnf systems.
+Linux needs the X11/Wayland/OpenGL/PipeWire dev packages and libclang —
+`build.sh` installs them on apt/dnf systems.
+
+**Wayland:** compositors don't let apps read the screen directly, so on
+Wayland the app uses the desktop's screen-sharing portal (the same one OBS
+uses). On first launch you'll get a "share your screen" dialog — pick the
+monitor you want to scan. The permission is remembered, so later launches
+don't ask again (to reset it, delete `~/.config/qr-frame/screencast-token`).
+Because Wayland hides window positions, the whole shared monitor is scanned
+rather than just the frame. Requires PipeWire and an xdg-desktop-portal
+backend (GNOME, KDE, wlroots/Sway, Hyprland). Installing the included
+`com.berkay.qr-frame.desktop` file to `~/.local/share/applications/` gives
+the app a proper name and icon in the dialog.
 
 **Manual:**
 ```

@@ -3,6 +3,9 @@
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[cfg(target_os = "linux")]
+mod wayland_capture;
+
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -514,6 +517,7 @@ fn draw_corners(painter: &egui::Painter, rect: Rect, color: Color32, arm: f32, w
 // ── Scan thread ────────────────────────────────────────────────────
 fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui::Context) {
     let mut last_wayland_fallback_scan = Instant::now() - WAYLAND_FALLBACK_SCAN_INTERVAL;
+    let mut screen_stream: ScreenStream = Default::default();
 
     loop {
         thread::sleep(Duration::from_millis(150));
@@ -562,6 +566,17 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
                 }
             }
         } else {
+            match poll_screen_stream(&mut screen_stream, &ctx) {
+                StreamPoll::Frame(luma) => {
+                    clear_capture_error(&state, &ctx);
+                    let decoded = try_decode_variants(&luma);
+                    publish_decoded(&state, &ctx, decoded);
+                    continue;
+                }
+                StreamPoll::Pending => continue,
+                StreamPoll::Unavailable => {}
+            }
+
             if last_wayland_fallback_scan.elapsed() < WAYLAND_FALLBACK_SCAN_INTERVAL {
                 continue;
             }
@@ -584,18 +599,60 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
             }
         };
 
-        let mut s = state.lock().unwrap();
-        if let Some(text) = decoded {
-            if text != s.decoded {
-                s.decoded = text;
-                s.flash_until = Some(Instant::now() + Duration::from_millis(200));
-                ctx.request_repaint();
-            }
-        } else if !s.decoded.is_empty() {
-            s.decoded.clear();
+        publish_decoded(&state, &ctx, decoded);
+    }
+}
+
+fn publish_decoded(state: &Arc<Mutex<ScanState>>, ctx: &egui::Context, decoded: Option<String>) {
+    let mut s = state.lock().unwrap();
+    if let Some(text) = decoded {
+        if text != s.decoded {
+            s.decoded = text;
+            s.flash_until = Some(Instant::now() + Duration::from_millis(200));
             ctx.request_repaint();
         }
+    } else if !s.decoded.is_empty() {
+        s.decoded.clear();
+        ctx.request_repaint();
     }
+}
+
+// ── Wayland screen cast stream ─────────────────────────────────────
+// Only Linux/Wayland needs it: elsewhere the window origin is known and
+// `screenshots` can grab exactly the viewfinder area.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum StreamPoll {
+    Frame(GrayImage),
+    Pending,
+    Unavailable,
+}
+
+#[cfg(target_os = "linux")]
+type ScreenStream = Option<wayland_capture::WaylandCapture>;
+#[cfg(not(target_os = "linux"))]
+type ScreenStream = ();
+
+#[cfg(target_os = "linux")]
+fn poll_screen_stream(stream: &mut ScreenStream, ctx: &egui::Context) -> StreamPoll {
+    if !wayland_capture::is_wayland_session() {
+        return StreamPoll::Unavailable;
+    }
+    let capture = stream.get_or_insert_with(|| {
+        let ctx = ctx.clone();
+        wayland_capture::WaylandCapture::start(move || ctx.request_repaint())
+    });
+    if capture.failed() {
+        return StreamPoll::Unavailable;
+    }
+    match capture.take_frame() {
+        Some(luma) => StreamPoll::Frame(luma),
+        None => StreamPoll::Pending,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn poll_screen_stream(_: &mut ScreenStream, _: &egui::Context) -> StreamPoll {
+    StreamPoll::Unavailable
 }
 
 fn clear_capture_error(state: &Arc<Mutex<ScanState>>, ctx: &egui::Context) {

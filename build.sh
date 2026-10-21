@@ -17,9 +17,10 @@ if [ "$(uname)" = "Linux" ]; then
         sudo apt-get install -y \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxkbcommon-dev \
-            libgl1-mesa-dev pkg-config 2>/dev/null || true
+            libxcb-randr0-dev libwayland-dev libdbus-1-dev libgl1-mesa-dev \
+            libpipewire-0.3-dev libclang-dev pkg-config 2>/dev/null || true
     elif command -v dnf &>/dev/null; then
-        sudo dnf install -y libxcb-devel libxkbcommon-devel mesa-libGL-devel 2>/dev/null || true
+        sudo dnf install -y libxcb-devel libxkbcommon-devel mesa-libGL-devel wayland-devel dbus-devel pipewire-devel clang-devel 2>/dev/null || true
     fi
 fi
 
