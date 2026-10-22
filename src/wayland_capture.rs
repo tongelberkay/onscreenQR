@@ -193,7 +193,13 @@ fn run_pipewire(
             } else {
                 size.width as usize * 4
             };
-            if let Some(img) = to_luma(&bytes[offset.min(bytes.len())..], size.width, size.height, stride, format) {
+            if let Some(img) = to_luma(
+                &bytes[offset.min(bytes.len())..],
+                size.width,
+                size.height,
+                stride,
+                format,
+            ) {
                 data.last_frame = Some(Instant::now());
                 let mut s = frame_shared.lock().unwrap();
                 s.latest = Some(img);
@@ -219,14 +225,23 @@ fn run_pipewire(
     Err("Screen cast stream ended".into())
 }
 
-fn to_luma(bytes: &[u8], width: u32, height: u32, stride: usize, format: VideoFormat) -> Option<GrayImage> {
+fn to_luma(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    format: VideoFormat,
+) -> Option<GrayImage> {
     // Channel order of the first three bytes; the fourth is alpha/padding.
     let (r, g, b) = match format {
         VideoFormat::BGRx | VideoFormat::BGRA => (2, 1, 0),
         VideoFormat::RGBx | VideoFormat::RGBA => (0, 1, 2),
         _ => return None,
     };
-    if width < 10 || height < 10 || bytes.len() < stride * (height as usize - 1) + width as usize * 4 {
+    if width < 10
+        || height < 10
+        || bytes.len() < stride * (height as usize - 1) + width as usize * 4
+    {
         return None;
     }
     let mut luma = Vec::with_capacity((width * height) as usize);
@@ -265,9 +280,18 @@ fn build_format_pod() -> Vec<u8> {
             Choice,
             Range,
             Rectangle,
-            Rectangle { width: 1920, height: 1080 },
-            Rectangle { width: 1, height: 1 },
-            Rectangle { width: 8192, height: 8192 }
+            Rectangle {
+                width: 1920,
+                height: 1080
+            },
+            Rectangle {
+                width: 1,
+                height: 1
+            },
+            Rectangle {
+                width: 8192,
+                height: 8192
+            }
         ),
         property!(
             FormatProperties::VideoFramerate,
@@ -276,13 +300,19 @@ fn build_format_pod() -> Vec<u8> {
             Fraction,
             Fraction { num: 5, denom: 1 },
             Fraction { num: 0, denom: 1 },
-            Fraction { num: 1000, denom: 1 }
+            Fraction {
+                num: 1000,
+                denom: 1
+            }
         ),
     );
-    spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
-        .expect("serialize format pod")
-        .0
-        .into_inner()
+    spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &Value::Object(obj),
+    )
+    .expect("serialize format pod")
+    .0
+    .into_inner()
 }
 
 // ── Restore token (skips the share dialog on later launches) ──────

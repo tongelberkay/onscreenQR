@@ -11,13 +11,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
-use eframe::egui::{
-    self, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, ResizeDirection, Stroke, Vec2,
-};
+use eframe::egui::{self, Color32, CornerRadius, FontId, Pos2, Rect, Stroke, Vec2};
 use image::{GrayImage, ImageBuffer, Luma};
 use rxing::{
-    common::HybridBinarizer, BinaryBitmap, DecodeHintType,
-    DecodeHintValue, Luma8LuminanceSource, MultiFormatReader, Reader,
+    common::HybridBinarizer, BinaryBitmap, DecodeHintType, DecodeHintValue, Luma8LuminanceSource,
+    MultiFormatReader, Reader,
 };
 use screenshots::Screen;
 
@@ -28,6 +26,8 @@ struct ScanState {
     flash_until: Option<Instant>,
     copied_until: Option<Instant>,
     last_error: Option<String>,
+    idle: bool,
+    wake_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,15 +86,18 @@ struct QrFrameApp {
     state: Arc<Mutex<ScanState>>,
     capture_rect: CaptureRect,
     clipboard: Option<Clipboard>,
+    update: Arc<Mutex<UpdateStatus>>,
+    show_about: bool,
 }
 
 impl QrFrameApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.visuals.panel_fill = Color32::TRANSPARENT;
-        style.visuals.window_fill = Color32::TRANSPARENT;
-        style.visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
-        cc.egui_ctx.set_style(style);
+        // Follow the OS theme so the UI matches the native title bar
+        cc.egui_ctx.all_styles_mut(|style| {
+            style.visuals.panel_fill = Color32::TRANSPARENT;
+            style.visuals.window_fill = Color32::TRANSPARENT;
+            style.visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
+        });
 
         let state: Arc<Mutex<ScanState>> = Arc::new(Mutex::new(ScanState::default()));
         let capture_rect: CaptureRect = Arc::new(Mutex::new(None));
@@ -106,19 +109,87 @@ impl QrFrameApp {
             thread::spawn(move || scan_loop(state, capture_rect, ctx));
         }
 
+        let update = Arc::new(Mutex::new(UpdateStatus::Unknown));
+        spawn_update_check(Arc::clone(&update), cc.egui_ctx.clone());
+
         Self {
             state,
             capture_rect,
             clipboard: Clipboard::new().ok(),
+            update,
+            show_about: false,
         }
     }
 }
 
-// ── Resize border thickness (logical pixels) ──────────────────────
-const RESIZE_BORDER: f32 = 6.0;
+// ── Colors for the light and dark themes ───────────────────────────
+struct Palette {
+    bar_bg: Color32,
+    panel_bg: Color32,
+    box_bg: Color32,
+    viewfinder_tint: Color32,
+    text_main: Color32,
+    text_muted: Color32,
+    text_label: Color32,
+    text_faint: Color32,
+    accent: Color32,
+    accent_dim: Color32,
+    copied_fg: Color32,
+    copied_bg: Color32,
+    error: Color32,
+    flash: Color32,
+}
+
+impl Palette {
+    fn for_theme(theme: egui::Theme) -> Self {
+        match theme {
+            egui::Theme::Dark => Self {
+                bar_bg: Color32::from_rgba_unmultiplied(17, 17, 17, 240),
+                panel_bg: Color32::from_rgba_unmultiplied(10, 10, 10, 240),
+                box_bg: Color32::from_rgb(20, 20, 20),
+                viewfinder_tint: Color32::from_rgba_premultiplied(13, 26, 18, 60),
+                text_main: Color32::from_rgb(224, 224, 224),
+                text_muted: Color32::from_rgb(130, 130, 130),
+                text_label: Color32::from_rgb(110, 110, 110),
+                text_faint: Color32::from_rgb(90, 90, 90),
+                accent: Color32::from_rgb(0, 232, 122),
+                accent_dim: Color32::from_rgb(0, 90, 48),
+                copied_fg: Color32::WHITE,
+                copied_bg: Color32::from_rgb(0, 42, 24),
+                error: Color32::from_rgb(255, 68, 85),
+                flash: Color32::WHITE,
+            },
+            egui::Theme::Light => Self {
+                bar_bg: Color32::from_rgba_unmultiplied(246, 246, 246, 245),
+                panel_bg: Color32::from_rgba_unmultiplied(250, 250, 250, 245),
+                box_bg: Color32::from_rgb(236, 236, 236),
+                viewfinder_tint: Color32::from_rgba_unmultiplied(0, 140, 70, 18),
+                text_main: Color32::from_rgb(30, 30, 30),
+                text_muted: Color32::from_rgb(105, 105, 105),
+                text_label: Color32::from_rgb(120, 120, 120),
+                text_faint: Color32::from_rgb(150, 150, 150),
+                accent: Color32::from_rgb(0, 140, 72),
+                accent_dim: Color32::from_rgb(130, 190, 155),
+                copied_fg: Color32::from_rgb(0, 100, 50),
+                copied_bg: Color32::from_rgb(210, 240, 222),
+                error: Color32::from_rgb(200, 30, 50),
+                flash: Color32::from_rgb(40, 220, 120),
+            },
+        }
+    }
+}
+
 const APP_ID: &str = "com.berkay.qr-frame";
 const APP_TITLE: &str = "QR Frame";
 const WAYLAND_FALLBACK_SCAN_INTERVAL: Duration = Duration::from_millis(1200);
+const ACTIVE_SCAN_INTERVAL: Duration = Duration::from_millis(150);
+// Scanning slows down once the window has stayed put this long. It never
+// stops fully, since the content under a still window can still change.
+const IDLE_AFTER: Duration = Duration::from_secs(5);
+const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(4);
+// With a QR already found, a still window rarely needs rechecking
+const DETECTED_SCAN_INTERVAL: Duration = Duration::from_secs(10);
+const MOVE_SETTLE: Duration = Duration::from_millis(250);
 
 impl eframe::App for QrFrameApp {
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
@@ -126,194 +197,50 @@ impl eframe::App for QrFrameApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(150));
+        // Hovering the window counts as activity and wakes the scanner
+        if ctx.input(|i| i.pointer.has_pointer()) {
+            self.state.lock().unwrap().wake_until = Some(Instant::now() + IDLE_AFTER);
+        }
         let state = self.state.lock().unwrap().clone();
+        let p = Palette::for_theme(ctx.theme());
+        ctx.request_repaint_after(if state.idle {
+            Duration::from_secs(1)
+        } else {
+            ACTIVE_SCAN_INTERVAL
+        });
 
-        let win_rect = ctx.screen_rect();
-
-        // ── Resize hit zones on all edges + corners ────────────────
-        // We paint invisible interaction zones along every edge/corner
-        // and issue BeginResize when the user drags them.
-        let dirs: &[(ResizeDirection, Rect)] = &[
-            (
-                ResizeDirection::NorthWest,
-                Rect::from_min_size(win_rect.min, Vec2::splat(RESIZE_BORDER)),
-            ),
-            (
-                ResizeDirection::North,
-                Rect::from_min_size(
-                    Pos2::new(win_rect.min.x + RESIZE_BORDER, win_rect.min.y),
-                    Vec2::new(win_rect.width() - RESIZE_BORDER * 2.0, RESIZE_BORDER),
-                ),
-            ),
-            (
-                ResizeDirection::NorthEast,
-                Rect::from_min_size(
-                    Pos2::new(win_rect.max.x - RESIZE_BORDER, win_rect.min.y),
-                    Vec2::splat(RESIZE_BORDER),
-                ),
-            ),
-            (
-                ResizeDirection::East,
-                Rect::from_min_size(
-                    Pos2::new(
-                        win_rect.max.x - RESIZE_BORDER,
-                        win_rect.min.y + RESIZE_BORDER,
-                    ),
-                    Vec2::new(RESIZE_BORDER, win_rect.height() - RESIZE_BORDER * 2.0),
-                ),
-            ),
-            (
-                ResizeDirection::SouthEast,
-                Rect::from_min_size(
-                    win_rect.max - Vec2::splat(RESIZE_BORDER),
-                    Vec2::splat(RESIZE_BORDER),
-                ),
-            ),
-            (
-                ResizeDirection::South,
-                Rect::from_min_size(
-                    Pos2::new(
-                        win_rect.min.x + RESIZE_BORDER,
-                        win_rect.max.y - RESIZE_BORDER,
-                    ),
-                    Vec2::new(win_rect.width() - RESIZE_BORDER * 2.0, RESIZE_BORDER),
-                ),
-            ),
-            (
-                ResizeDirection::SouthWest,
-                Rect::from_min_size(
-                    Pos2::new(win_rect.min.x, win_rect.max.y - RESIZE_BORDER),
-                    Vec2::splat(RESIZE_BORDER),
-                ),
-            ),
-            (
-                ResizeDirection::West,
-                Rect::from_min_size(
-                    Pos2::new(win_rect.min.x, win_rect.min.y + RESIZE_BORDER),
-                    Vec2::new(RESIZE_BORDER, win_rect.height() - RESIZE_BORDER * 2.0),
-                ),
-            ),
-        ];
-
-        // Use an Area that covers the full window for resize zones
-        egui::Area::new(egui::Id::new("resize_zones"))
-            .fixed_pos(win_rect.min)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                for (dir, rect) in dirs {
-                    let cursor = resize_cursor(*dir);
-                    let resp = ui.interact(
-                        *rect,
-                        egui::Id::new(format!("resize_{:?}", dir)),
-                        egui::Sense::drag(),
-                    );
-                    if resp.hovered() {
-                        ctx.set_cursor_icon(cursor);
-                    }
-                    if resp.drag_started() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(*dir));
-                    }
-                }
-            });
-
-        // ── Title bar ──────────────────────────────────────────────
-        let title_id = egui::Id::new("titlebar_drag");
-        egui::TopBottomPanel::top("titlebar")
+        // ── Hint bar ───────────────────────────────────────────────
+        egui::TopBottomPanel::top("hint_bar")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(17, 17, 17, 240))
-                    .inner_margin(egui::Margin::symmetric(12, 8)),
+                    .fill(p.bar_bg)
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
-                let mut buttons_min_x = f32::MAX;
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("QR FRAME")
-                            .font(FontId::monospace(11.0))
-                            .color(Color32::from_rgb(224, 224, 224))
-                            .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new("  position over a QR code")
+                        egui::RichText::new("position over a QR code")
                             .font(FontId::monospace(9.0))
-                            .color(Color32::from_rgb(56, 56, 56)),
+                            .color(p.text_muted),
                     );
-
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let btn_size = Vec2::new(28.0, 28.0);
-
-                        // Close button — turns red on hover
-                        let (close_rect, close) =
-                            ui.allocate_exact_size(btn_size, egui::Sense::click());
-                        let close_color = if close.hovered() {
-                            ctx.set_cursor_icon(CursorIcon::PointingHand);
-                            Color32::from_rgb(255, 68, 85)
-                        } else {
-                            Color32::from_rgb(80, 80, 80)
-                        };
-                        ui.painter().text(
-                            close_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "✕",
-                            FontId::monospace(13.0),
-                            close_color,
-                        );
-                        if close.clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        let update_available =
+                            matches!(*self.update.lock().unwrap(), UpdateStatus::Available(_));
+                        if info_button(ui, &p, update_available).clicked() {
+                            self.show_about = !self.show_about;
                         }
-
-                        ui.add_space(4.0);
-
-                        // Minimize button — turns white on hover
-                        let (mini_rect, mini) =
-                            ui.allocate_exact_size(btn_size, egui::Sense::click());
-                        let mini_color = if mini.hovered() {
-                            ctx.set_cursor_icon(CursorIcon::PointingHand);
-                            Color32::from_rgb(224, 224, 224)
-                        } else {
-                            Color32::from_rgb(80, 80, 80)
-                        };
-                        ui.painter().text(
-                            mini_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "—",
-                            FontId::monospace(13.0),
-                            mini_color,
-                        );
-                        if mini.clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                        }
-
-                        // Track leftmost button edge so drag zone won't overlap
-                        buttons_min_x = mini_rect.min.x.min(close_rect.min.x);
                     });
                 });
-
-                // Drag title bar to move window — only the area LEFT of the buttons
-                let titlebar_rect = ui.max_rect();
-                let drag_rect = Rect::from_min_max(
-                    titlebar_rect.min,
-                    Pos2::new(buttons_min_x, titlebar_rect.max.y),
-                );
-                let drag = ui.interact(drag_rect, title_id, egui::Sense::click_and_drag());
-                if drag.is_pointer_button_down_on() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
             });
 
         // ── Result + copy panel ────────────────────────────────────
         egui::TopBottomPanel::bottom("result_panel")
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(10, 10, 10, 240))
-                    .inner_margin(12.0),
-            )
+            .frame(egui::Frame::new().fill(p.panel_bg).inner_margin(12.0))
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new("RESULT")
                         .font(FontId::monospace(9.0))
-                        .color(Color32::from_rgb(42, 42, 42))
+                        .color(p.text_label)
                         .strong(),
                 );
                 ui.add_space(4.0);
@@ -321,15 +248,15 @@ impl eframe::App for QrFrameApp {
                 let result_text = if state.decoded.is_empty() {
                     egui::RichText::new("—")
                         .font(FontId::monospace(10.0))
-                        .color(Color32::from_rgb(50, 50, 50))
+                        .color(p.text_faint)
                 } else {
                     egui::RichText::new(&state.decoded)
                         .font(FontId::monospace(10.0))
-                        .color(Color32::from_rgb(0, 232, 122))
+                        .color(p.accent)
                 };
 
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(20, 20, 20))
+                    .fill(p.box_bg)
                     .inner_margin(10.0)
                     .corner_radius(CornerRadius::same(4))
                     .show(ui, |ui| {
@@ -345,19 +272,11 @@ impl eframe::App for QrFrameApp {
                     .map(|t| t > Instant::now())
                     .unwrap_or(false);
                 let (btn_text, btn_color, btn_bg) = if copied {
-                    ("✓  COPIED!", Color32::WHITE, Color32::from_rgb(0, 42, 24))
+                    ("COPIED!", p.copied_fg, p.copied_bg)
                 } else if state.decoded.is_empty() {
-                    (
-                        "⎘  COPY TO CLIPBOARD",
-                        Color32::from_rgb(42, 42, 42),
-                        Color32::from_rgb(20, 20, 20),
-                    )
+                    ("COPY TO CLIPBOARD", p.text_faint, p.box_bg)
                 } else {
-                    (
-                        "⎘  COPY TO CLIPBOARD",
-                        Color32::from_rgb(0, 232, 122),
-                        Color32::from_rgb(20, 20, 20),
-                    )
+                    ("COPY TO CLIPBOARD", p.accent, p.box_bg)
                 };
 
                 let btn = egui::Button::new(
@@ -378,37 +297,52 @@ impl eframe::App for QrFrameApp {
                 }
             });
 
+        // ── About panel (covers the viewfinder while open) ─────────
+        if self.show_about {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(p.bar_bg).inner_margin(16.0))
+                .show(ctx, |ui| self.about_ui(ui, &p));
+            return;
+        }
+
         // ── Viewfinder (transparent scan area) ─────────────────────
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::TRANSPARENT))
             .show(ctx, |ui| {
                 let available = ui.available_rect_before_wrap();
 
-                ui.painter().rect_filled(
-                    available,
-                    CornerRadius::ZERO,
-                    Color32::from_rgba_premultiplied(13, 26, 18, 60),
-                );
+                ui.painter()
+                    .rect_filled(available, CornerRadius::ZERO, p.viewfinder_tint);
 
                 let flashing = state
                     .flash_until
                     .map(|t| t > Instant::now())
                     .unwrap_or(false);
                 let corner_color = if flashing {
-                    Color32::WHITE
+                    p.flash
+                } else if state.idle {
+                    p.accent_dim
                 } else {
-                    Color32::from_rgb(0, 232, 122)
+                    p.accent
                 };
-                draw_corners(ui.painter(), available, corner_color, 24.0, 2.0);
+                draw_corners(
+                    ui.painter(),
+                    available,
+                    corner_color,
+                    24.0,
+                    if flashing { 4.0 } else { 2.0 },
+                );
 
                 let error_str;
                 let (status_text, status_color) = if let Some(err) = state.last_error.as_deref() {
                     error_str = format!("Err: {}", err);
-                    (error_str.as_str(), Color32::from_rgb(255, 68, 85))
-                } else if state.decoded.is_empty() {
-                    ("Scanning screen…", Color32::from_rgb(56, 56, 56))
+                    (error_str.as_str(), p.error)
+                } else if !state.decoded.is_empty() {
+                    ("QR detected", p.accent)
+                } else if state.idle {
+                    ("Idle · move window to resume", p.text_muted)
                 } else {
-                    ("✓  QR detected", Color32::from_rgb(0, 232, 122))
+                    ("Scanning screen…", p.text_muted)
                 };
                 ui.painter().text(
                     Pos2::new(available.center().x, available.max.y - 10.0),
@@ -436,91 +370,214 @@ impl eframe::App for QrFrameApp {
     }
 }
 
-// ── Map resize direction to cursor icon ───────────────────────────
-fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
-    match dir {
-        ResizeDirection::North => CursorIcon::ResizeNorth,
-        ResizeDirection::South => CursorIcon::ResizeSouth,
-        ResizeDirection::East => CursorIcon::ResizeEast,
-        ResizeDirection::West => CursorIcon::ResizeWest,
-        ResizeDirection::NorthWest => CursorIcon::ResizeNorthWest,
-        ResizeDirection::NorthEast => CursorIcon::ResizeNorthEast,
-        ResizeDirection::SouthWest => CursorIcon::ResizeSouthWest,
-        ResizeDirection::SouthEast => CursorIcon::ResizeSouthEast,
+// ── About panel ────────────────────────────────────────────────────
+const REPO_URL: &str = "https://github.com/tongelberkay/onscreenQR";
+
+impl QrFrameApp {
+    fn about_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let text = |s: &str, size: f32, color: Color32| {
+            egui::RichText::new(s)
+                .font(FontId::monospace(size))
+                .color(color)
+        };
+        let button = |s: &str| {
+            egui::Button::new(text(s, 9.0, p.text_main).strong())
+                .fill(p.box_bg)
+                .min_size(Vec2::new(0.0, 26.0))
+        };
+
+        ui.label(text("QR FRAME", 13.0, p.text_main).strong());
+        ui.label(text(
+            concat!("version ", env!("CARGO_PKG_VERSION")),
+            9.0,
+            p.text_muted,
+        ));
+        ui.add_space(8.0);
+        ui.label(text(env!("CARGO_PKG_DESCRIPTION"), 9.0, p.text_muted));
+        ui.add_space(4.0);
+        ui.hyperlink_to(
+            text("github.com/tongelberkay/onscreenQR", 9.0, p.accent),
+            REPO_URL,
+        );
+
+        ui.add_space(16.0);
+        ui.label(text("UPDATES", 9.0, p.text_label).strong());
+        ui.add_space(4.0);
+
+        let status = self.update.lock().unwrap().clone();
+        let (status_text, status_color) = match &status {
+            UpdateStatus::Unknown => ("Not checked yet".to_string(), p.text_muted),
+            UpdateStatus::Checking => ("Checking…".to_string(), p.text_muted),
+            UpdateStatus::UpToDate => ("You're on the latest version".to_string(), p.text_muted),
+            UpdateStatus::Available(tag) => (format!("Update available: {tag}"), p.accent),
+            UpdateStatus::Failed => ("Couldn't check for updates".to_string(), p.error),
+        };
+        ui.label(text(&status_text, 9.0, status_color));
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            if let UpdateStatus::Available(_) = status {
+                if ui.add(button("DOWNLOAD")).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
+                        "{REPO_URL}/releases/latest"
+                    )));
+                }
+            }
+            let checking = status == UpdateStatus::Checking;
+            if ui.add_enabled(!checking, button("CHECK NOW")).clicked() {
+                spawn_update_check(Arc::clone(&self.update), ui.ctx().clone());
+            }
+        });
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            if ui
+                .add(button("CLOSE").min_size(Vec2::new(ui.available_width(), 28.0)))
+                .clicked()
+            {
+                self.show_about = false;
+            }
+        });
     }
+}
+
+// ── Info button (drawn, so it never depends on font glyphs) ────────
+fn info_button(ui: &mut egui::Ui, p: &Palette, badge: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::click());
+    let color = if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        p.text_main
+    } else {
+        p.text_muted
+    };
+    let c = rect.center();
+    let painter = ui.painter();
+    painter.circle_stroke(c, 6.0, Stroke::new(1.2_f32, color));
+    painter.circle_filled(c + Vec2::new(0.0, -2.8), 0.9, color);
+    painter.line_segment(
+        [c + Vec2::new(0.0, -0.8), c + Vec2::new(0.0, 3.2)],
+        Stroke::new(1.3_f32, color),
+    );
+    if badge {
+        painter.circle_filled(rect.right_top() + Vec2::new(-2.0, 2.0), 2.5, p.accent);
+    }
+    resp.on_hover_text("About")
+}
+
+// ── Update check (GitHub Releases, notify only) ────────────────────
+const LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/tongelberkay/onscreenQR/releases/latest";
+
+#[derive(Debug, Clone, Default, PartialEq)]
+enum UpdateStatus {
+    #[default]
+    Unknown,
+    Checking,
+    UpToDate,
+    Available(String),
+    Failed,
+}
+
+fn spawn_update_check(status: Arc<Mutex<UpdateStatus>>, ctx: egui::Context) {
+    *status.lock().unwrap() = UpdateStatus::Checking;
+    thread::spawn(move || {
+        let result = match fetch_latest_tag() {
+            Some(tag) if is_newer(&tag, env!("CARGO_PKG_VERSION")) => UpdateStatus::Available(tag),
+            Some(_) => UpdateStatus::UpToDate,
+            None => UpdateStatus::Failed,
+        };
+        *status.lock().unwrap() = result;
+        ctx.request_repaint();
+    });
+}
+
+fn fetch_latest_tag() -> Option<String> {
+    let body = ureq::get(LATEST_RELEASE_API)
+        .set(
+            "User-Agent",
+            concat!("qr-frame/", env!("CARGO_PKG_VERSION")),
+        )
+        .set("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(10))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    // Only "tag_name" is needed, so pull it out without a JSON parser
+    let rest = body.split("\"tag_name\"").nth(1)?;
+    let start = rest.find('"')? + 1;
+    let end = start + rest[start..].find('"')?;
+    Some(rest[start..end].to_string())
+}
+
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = v
+        .trim_start_matches('v')
+        .split(['.', '-', '+'])
+        .map(|p| p.parse::<u64>().ok());
+    Some((
+        parts.next()??,
+        parts.next()??,
+        parts.next().flatten().unwrap_or(0),
+    ))
+}
+
+fn is_newer(tag: &str, current: &str) -> bool {
+    matches!((parse_version(tag), parse_version(current)), (Some(a), Some(b)) if a > b)
 }
 
 // ── Corner bracket painter ─────────────────────────────────────────
 fn draw_corners(painter: &egui::Painter, rect: Rect, color: Color32, arm: f32, width: f32) {
-    let stroke = Stroke::new(width, color);
-    let min = rect.min;
-    let max = rect.max;
     let pad = 4.0;
-    painter.line_segment(
-        [
-            Pos2::new(min.x + pad, min.y + pad + arm),
-            Pos2::new(min.x + pad, min.y + pad),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(min.x + pad, min.y + pad),
-            Pos2::new(min.x + pad + arm, min.y + pad),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(max.x - pad - arm, min.y + pad),
-            Pos2::new(max.x - pad, min.y + pad),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(max.x - pad, min.y + pad),
-            Pos2::new(max.x - pad, min.y + pad + arm),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(min.x + pad, max.y - pad - arm),
-            Pos2::new(min.x + pad, max.y - pad),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(min.x + pad, max.y - pad),
-            Pos2::new(min.x + pad + arm, max.y - pad),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(max.x - pad, max.y - pad - arm),
-            Pos2::new(max.x - pad, max.y - pad),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(max.x - pad, max.y - pad),
-            Pos2::new(max.x - pad - arm, max.y - pad),
-        ],
-        stroke,
-    );
+    let radius = 6.0;
+    let inner = rect.shrink(pad);
+    // (corner point, horizontal direction, vertical direction) into the frame
+    let corners = [
+        (inner.left_top(), 1.0, 1.0),
+        (inner.right_top(), -1.0, 1.0),
+        (inner.left_bottom(), 1.0, -1.0),
+        (inner.right_bottom(), -1.0, -1.0),
+    ];
+    for (c, dx, dy) in corners {
+        // Vertical arm, rounded bend, horizontal arm as one continuous path
+        let center = c + Vec2::new(dx * radius, dy * radius);
+        let points: Vec<Pos2> = (0..=8)
+            .map(|i| {
+                let t = std::f32::consts::FRAC_PI_2 * i as f32 / 8.0;
+                center + Vec2::new(-dx * radius * t.cos(), -dy * radius * t.sin())
+            })
+            .collect();
+        painter.add(egui::epaint::PathShape::line(
+            points,
+            Stroke::new(width, color),
+        ));
+
+        // Arms as capsules: one anti-aliased shape each, so the tips come out
+        // round and as smooth as the rest of the bracket
+        let half = width / 2.0;
+        let vertical = Rect::from_two_pos(
+            c + Vec2::new(-half, dy * (arm - half)),
+            c + Vec2::new(half, dy * radius),
+        );
+        let horizontal = Rect::from_two_pos(
+            c + Vec2::new(dx * (arm - half), -half),
+            c + Vec2::new(dx * radius, half),
+        );
+        let capsule = CornerRadius::same(half.round() as u8);
+        painter.rect_filled(vertical.expand2(Vec2::new(0.0, half)), capsule, color);
+        painter.rect_filled(horizontal.expand2(Vec2::new(half, 0.0)), capsule, color);
+    }
 }
 
 // ── Scan thread ────────────────────────────────────────────────────
 fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui::Context) {
     let mut last_wayland_fallback_scan = Instant::now() - WAYLAND_FALLBACK_SCAN_INTERVAL;
     let mut screen_stream: ScreenStream = Default::default();
+    let mut last_area: Option<CaptureArea> = None;
+    let mut last_moved = Instant::now();
+    let mut last_scan = Instant::now() - IDLE_SCAN_INTERVAL;
 
     loop {
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(ACTIVE_SCAN_INTERVAL);
 
         let capture_request = match *capture_rect.lock().unwrap() {
             Some(r) => r,
@@ -531,6 +588,33 @@ fn scan_loop(state: Arc<Mutex<ScanState>>, capture_rect: CaptureRect, ctx: egui:
         if capture_area.width < 10 || capture_area.height < 10 {
             continue;
         }
+
+        // Moving or resizing the window changes the capture area
+        if last_area != Some(capture_area) {
+            last_area = Some(capture_area);
+            last_moved = Instant::now();
+        }
+        let (idle, idle_interval) = {
+            let mut s = state.lock().unwrap();
+            let woken = s.wake_until.is_some_and(|t| t > Instant::now());
+            let idle = !woken && last_moved.elapsed() >= IDLE_AFTER;
+            if s.idle != idle {
+                s.idle = idle;
+                ctx.request_repaint();
+            }
+            let interval = if s.decoded.is_empty() {
+                IDLE_SCAN_INTERVAL
+            } else {
+                DETECTED_SCAN_INTERVAL
+            };
+            (idle, interval)
+        };
+        // Skip captures mid-drag: grabbing the screen under a moving window
+        // stalls the compositor and makes dragging stutter
+        if last_moved.elapsed() < MOVE_SETTLE || (idle && last_scan.elapsed() < idle_interval) {
+            continue;
+        }
+        last_scan = Instant::now();
 
         let decoded = if capture_request.window_origin_known {
             let (anchor_x, anchor_y) = capture_area.anchor_point();
@@ -608,7 +692,7 @@ fn publish_decoded(state: &Arc<Mutex<ScanState>>, ctx: &egui::Context, decoded: 
     if let Some(text) = decoded {
         if text != s.decoded {
             s.decoded = text;
-            s.flash_until = Some(Instant::now() + Duration::from_millis(200));
+            s.flash_until = Some(Instant::now() + Duration::from_millis(350));
             ctx.request_repaint();
         }
     } else if !s.decoded.is_empty() {
@@ -904,7 +988,7 @@ fn main() {
             .with_app_id(APP_ID)
             .with_inner_size([380.0, 480.0])
             .with_min_inner_size([300.0, 400.0])
-            .with_decorations(false)
+            .with_decorations(true)
             .with_transparent(true)
             .with_always_on_top()
             .with_taskbar(true)

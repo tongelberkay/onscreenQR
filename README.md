@@ -11,9 +11,17 @@ Prebuilt binaries for Windows, Linux and macOS (Apple Silicon) are on the
 
 ## Usage
 
-- Drag the title bar to move, drag any edge to resize
 - Put the green frame over a QR code — the decoded text appears below
-- Click **⎘ COPY TO CLIPBOARD** to copy it
+- Click **COPY TO CLIPBOARD** to copy it
+- Scanning slows down when the window sits still; move or hover it to resume
+- The ⓘ button opens the About screen, with version info and an update check
+
+### Update check
+
+On launch the app makes one request to the GitHub Releases API to see if a
+newer version exists. If so, a dot appears on the ⓘ button and the About
+screen links to the release page. Nothing is downloaded or installed
+automatically, and no other network requests are made.
 
 ### Wayland
 
